@@ -1676,25 +1676,30 @@ run_spatial_selector <- function(seurat_input = NULL, sample_name = "sample", sh
             
             he_image_base64 <<- paste0("data:image/png;base64,", base64enc::base64encode(temp_file))
             unlink(temp_file)
-            
+
             he_image_bounds <<- list(
               south = crop_y_max,
               west = crop_x_min,
               north = crop_y_min,
               east = crop_x_max
             )
-            
+
+            updateCheckboxInput(session, "show_he", value = TRUE)
+
             # Update H&E image on map
             session$sendCustomMessage("updateHEImage", list(
               imageUrl = he_image_base64,
               bounds = he_image_bounds
             ))
-            
+            session$sendCustomMessage("toggleHEImage", list(show = TRUE))
+
             Sys.sleep(0.5)
           }
         }, error = function(e) {
           print(paste("Could not extract H&E image:", e$message))
           he_image_base64 <<- NULL
+          updateCheckboxInput(session, "show_he", value = FALSE)
+          session$sendCustomMessage("toggleHEImage", list(show = FALSE))
         })
         
         # Clear all selections and results
@@ -1734,7 +1739,9 @@ run_spatial_selector <- function(seurat_input = NULL, sample_name = "sample", sh
             radius = 5, stroke = TRUE, color = "black", weight = 0.5,
             fillColor = "lightblue", fillOpacity = 0.8, group = "spots"
           )
-        
+
+        updateCheckboxInput(session, "show_groups", value = TRUE)
+
         # Update loading message for final step
         shinyjs::runjs("$('#loading_message').text('Finalizing visualization...');")
         
@@ -1899,26 +1906,31 @@ run_spatial_selector <- function(seurat_input = NULL, sample_name = "sample", sh
             
             he_image_base64 <<- paste0("data:image/png;base64,", base64enc::base64encode(temp_file))
             unlink(temp_file)
-            
+
             he_image_bounds <<- list(
               south = crop_y_max,
               west = crop_x_min,
               north = crop_y_min,
               east = crop_x_max
             )
-            
+
+            updateCheckboxInput(session, "show_he", value = TRUE)
+
             # Update H&E image on map
             session$sendCustomMessage("updateHEImage", list(
               imageUrl = he_image_base64,
               bounds = he_image_bounds
             ))
-            
+            session$sendCustomMessage("toggleHEImage", list(show = TRUE))
+
             # Wait for H&E image to load
             Sys.sleep(0.5)
           }
         }, error = function(e) {
           print(paste("Could not extract H&E image from new data:", e$message))
           he_image_base64 <<- NULL
+          updateCheckboxInput(session, "show_he", value = FALSE)
+          session$sendCustomMessage("toggleHEImage", list(show = FALSE))
         })
         
         # Clear all selections and results
@@ -1958,7 +1970,9 @@ run_spatial_selector <- function(seurat_input = NULL, sample_name = "sample", sh
             radius = 5, stroke = TRUE, color = "black", weight = 0.5,
             fillColor = "lightblue", fillOpacity = 0.8, group = "spots"
           )
-        
+
+        updateCheckboxInput(session, "show_groups", value = TRUE)
+
         # Update loading message for final step
         shinyjs::runjs("$('#loading_message').text('Finalizing visualization...');")
         
@@ -2339,10 +2353,50 @@ run_spatial_selector <- function(seurat_input = NULL, sample_name = "sample", sh
       color_indices <- pmax(1, pmin(100, ceiling(norm_vals * 100)))
       colors <- pal[color_indices]
       colors[is.na(values)] <- "lightgrey"
-      
+
       return(colors)
     }
-    
+
+    render_saved_groups <- function(proxy, group1_ids = character(0), group2_ids = character(0)) {
+      if (is.null(spots_sf) || nrow(spots_sf) == 0) {
+        return(proxy %>%
+                 clearGroup("group1_display") %>%
+                 clearGroup("group2_display"))
+      }
+
+      proxy <- proxy %>%
+        clearGroup("group1_display") %>%
+        clearGroup("group2_display")
+
+      if (length(group1_ids) > 0) {
+        g1_indices <- which(spots_sf$spot_id %in% group1_ids)
+        if (length(g1_indices) > 0) {
+          proxy <- proxy %>%
+            addCircleMarkers(
+              lng = spots_sf$x[g1_indices],
+              lat = spots_sf$y[g1_indices],
+              radius = 4, stroke = TRUE, color = "darkred", weight = 2,
+              fillColor = "red", fillOpacity = 0.8, group = "group1_display"
+            )
+        }
+      }
+
+      if (length(group2_ids) > 0) {
+        g2_indices <- which(spots_sf$spot_id %in% group2_ids)
+        if (length(g2_indices) > 0) {
+          proxy <- proxy %>%
+            addCircleMarkers(
+              lng = spots_sf$x[g2_indices],
+              lat = spots_sf$y[g2_indices],
+              radius = 4, stroke = TRUE, color = "darkblue", weight = 2,
+              fillColor = "blue", fillOpacity = 0.8, group = "group2_display"
+            )
+        }
+      }
+
+      proxy
+    }
+
     observeEvent({
       input$feature_type
       input$gene_select
@@ -2393,21 +2447,13 @@ run_spatial_selector <- function(seurat_input = NULL, sample_name = "sample", sh
       values <- current_values()
       spot_radius <- input$spot_size
       
-      # Clear groups when updating visualization
-      leafletProxy("map") %>%
-        clearGroup("group1_display") %>%
-        clearGroup("group2_display")
-      
-      # Uncheck show_groups when new visualization is applied
-      updateCheckboxInput(session, "show_groups", value = FALSE)
-      
       if (is.null(values)) {
         colors <- rep("lightblue", nrow(spots_sf))
       } else {
         colors <- map_to_colors(input$color_scheme, values)
       }
-      
-      leafletProxy("map") %>%
+
+      proxy <- leafletProxy("map") %>%
         clearGroup("spots") %>%
         addCircleMarkers(
           lng = spots_sf$x, lat = spots_sf$y,
@@ -2419,6 +2465,14 @@ run_spatial_selector <- function(seurat_input = NULL, sample_name = "sample", sh
             paste0("Spot: ", spots_sf$spot_id, "<br>Value: ", round(values, 3))
           }
         )
+
+      if (isTRUE(isolate(input$show_groups))) {
+        render_saved_groups(proxy,
+                            isolate(group1_spots()),
+                            isolate(group2_spots()))
+      } else {
+        render_saved_groups(proxy)
+      }
     }
     
     output$color_legend <- renderPlot({
@@ -2837,15 +2891,7 @@ run_spatial_selector <- function(seurat_input = NULL, sample_name = "sample", sh
         # Immediately show the group on map if checkbox is checked
         if (input$show_groups) {
           Sys.sleep(0.1)
-          g1_indices <- which(spots_sf$spot_id %in% sel)
-          leafletProxy("map") %>%
-            clearGroup("group1_display") %>%
-            addCircleMarkers(
-              lng = spots_sf$x[g1_indices], 
-              lat = spots_sf$y[g1_indices],
-              radius = 4, stroke = TRUE, color = "darkred", weight = 2,
-              fillColor = "red", fillOpacity = 0.8, group = "group1_display"
-            )
+          render_saved_groups(leafletProxy("map"), sel, isolate(group2_spots()))
         }
       } else {
         showNotification("No spots selected!", type = "warning")
@@ -2875,15 +2921,7 @@ run_spatial_selector <- function(seurat_input = NULL, sample_name = "sample", sh
         # Immediately show the group on map if checkbox is checked
         if (input$show_groups) {
           Sys.sleep(0.1)
-          g2_indices <- which(spots_sf$spot_id %in% sel)
-          leafletProxy("map") %>%
-            clearGroup("group2_display") %>%
-            addCircleMarkers(
-              lng = spots_sf$x[g2_indices], 
-              lat = spots_sf$y[g2_indices],
-              radius = 4, stroke = TRUE, color = "darkblue", weight = 2,
-              fillColor = "blue", fillOpacity = 0.8, group = "group2_display"
-            )
+          render_saved_groups(leafletProxy("map"), isolate(group1_spots()), sel)
         }
       } else {
         showNotification("No spots selected!", type = "warning")
@@ -2902,40 +2940,13 @@ run_spatial_selector <- function(seurat_input = NULL, sample_name = "sample", sh
     
     observe({
       if (!data_is_loaded()) return()
-      
+
+      proxy <- leafletProxy("map")
+
       if (input$show_groups) {
-        g1 <- group1_spots()
-        g2 <- group2_spots()
-        
-        proxy <- leafletProxy("map") %>% 
-          clearGroup("group1_display") %>%
-          clearGroup("group2_display")
-        
-        if (length(g1) > 0) {
-          g1_indices <- which(spots_sf$spot_id %in% g1)
-          proxy <- proxy %>%
-            addCircleMarkers(
-              lng = spots_sf$x[g1_indices], 
-              lat = spots_sf$y[g1_indices],
-              radius = 4, stroke = TRUE, color = "darkred", weight = 2,
-              fillColor = "red", fillOpacity = 0.8, group = "group1_display"
-            )
-        }
-        
-        if (length(g2) > 0) {
-          g2_indices <- which(spots_sf$spot_id %in% g2)
-          proxy <- proxy %>%
-            addCircleMarkers(
-              lng = spots_sf$x[g2_indices], 
-              lat = spots_sf$y[g2_indices],
-              radius = 4, stroke = TRUE, color = "darkblue", weight = 2,
-              fillColor = "blue", fillOpacity = 0.8, group = "group2_display"
-            )
-        }
+        render_saved_groups(proxy, group1_spots(), group2_spots())
       } else {
-        leafletProxy("map") %>% 
-          clearGroup("group1_display") %>%
-          clearGroup("group2_display")
+        render_saved_groups(proxy)
       }
     }, priority = 1000)
     
