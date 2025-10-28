@@ -1553,16 +1553,40 @@ run_spatial_selector <- function(seurat_input = NULL, sample_name = "sample", sh
         new_seurat@images[[image_name]]@coordinates
       })
 
-      spots_df <- data.frame(spot_id = rownames(coords), stringsAsFactors = FALSE)
-      if ("imagerow" %in% colnames(coords) && "imagecol" %in% colnames(coords)) {
-        spots_df$x <- coords$imagecol
-        spots_df$y <- coords$imagerow
-      } else if ("row" %in% colnames(coords) && "col" %in% colnames(coords)) {
-        spots_df$x <- coords$col
-        spots_df$y <- coords$row
+      coords_df <- as.data.frame(coords)
+
+      spot_ids <- rownames(coords_df)
+      if (is.null(spot_ids) || length(spot_ids) == 0) {
+        if ("barcode" %in% colnames(coords_df)) {
+          spot_ids <- coords_df$barcode
+        } else if ("spot_id" %in% colnames(coords_df)) {
+          spot_ids <- coords_df$spot_id
+        }
+      }
+
+      if (is.null(spot_ids) || length(spot_ids) == 0) {
+        spot_ids <- colnames(new_seurat)
+      }
+
+      if (is.null(spot_ids) || length(spot_ids) == 0) {
+        stop("Unable to determine spot identifiers from the provided dataset")
+      }
+
+      if (length(spot_ids) != nrow(coords_df)) {
+        stop("Mismatch between the number of coordinates and spot identifiers in the dataset")
+      }
+
+      spots_df <- data.frame(spot_id = as.character(spot_ids), stringsAsFactors = FALSE)
+
+      if ("imagerow" %in% colnames(coords_df) && "imagecol" %in% colnames(coords_df)) {
+        spots_df$x <- coords_df$imagecol
+        spots_df$y <- coords_df$imagerow
+      } else if ("row" %in% colnames(coords_df) && "col" %in% colnames(coords_df)) {
+        spots_df$x <- coords_df$col
+        spots_df$y <- coords_df$row
       } else {
-        spots_df$x <- coords[,1]
-        spots_df$y <- coords[,2]
+        spots_df$x <- coords_df[[1]]
+        spots_df$y <- coords_df[[2]]
       }
 
       spots_sf <<- st_as_sf(spots_df, coords = c("x","y"), crs = NA)
