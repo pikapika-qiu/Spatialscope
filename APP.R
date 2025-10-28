@@ -20,32 +20,115 @@ library(ggforce)
 library(spacexr)
 library(Matrix)
 library(spdep)
-run_spatial_selector <- function(seurat_input, sample_name = "sample", show_image = TRUE) {
-  
-  # Handle different input formats
-  if (is.list(seurat_input) && "seurat" %in% names(seurat_input)) {
-    seurat_obj <- seurat_input$seurat
-  } else if (class(seurat_input)[1] == "Seurat") {
-    seurat_obj <- seurat_input
-  } else {
-    stop("Input must be either a Seurat object or a list containing $seurat component")
+run_spatial_selector <- function(seurat_input = NULL, sample_name = "sample", show_image = TRUE) {
+
+  seurat_obj <- NULL
+  image_name <- NULL
+  all_genes <- character(0)
+  all_metadata <- character(0)
+  spots_sf <- data.frame(spot_id = character(0), x = numeric(0), y = numeric(0), stringsAsFactors = FALSE)
+  x_range <- c(0, 1)
+  y_range <- c(0, 1)
+  x_buffer <- 0
+  y_buffer <- 0
+  he_image_base64 <- NULL
+  he_image_bounds <- NULL
+
+  if (!is.null(seurat_input)) {
+    # Handle different input formats
+    if (is.list(seurat_input) && "seurat" %in% names(seurat_input)) {
+      seurat_obj <- seurat_input$seurat
+    } else if (inherits(seurat_input, "Seurat")) {
+      seurat_obj <- seurat_input
+    } else {
+      stop("Input must be either a Seurat object or a list containing $seurat component")
+    }
+
+    if (length(seurat_obj@images) == 0) {
+      stop("No spatial images found in the Seurat object.")
+    }
+
+    image_name <- names(seurat_obj@images)[1]
+    all_genes <- rownames(seurat_obj)
+    all_metadata <- colnames(seurat_obj@meta.data)
+
+    # Extract coordinates
+    coords <- tryCatch({
+      GetTissueCoordinates(seurat_obj, image = image_name)
+    }, error = function(e) {
+      seurat_obj@images[[image_name]]@coordinates
+    })
+
+    spots_df <- data.frame(spot_id = rownames(coords), stringsAsFactors = FALSE)
+    if ("imagerow" %in% colnames(coords) && "imagecol" %in% colnames(coords)) {
+      spots_df$x <- coords$imagecol
+      spots_df$y <- coords$imagerow
+    } else if ("row" %in% colnames(coords) && "col" %in% colnames(coords)) {
+      spots_df$x <- coords$col
+      spots_df$y <- coords$row
+    } else {
+      spots_df$x <- coords[,1]
+      spots_df$y <- coords[,2]
+    }
+
+    spots_sf <- st_as_sf(spots_df, coords = c("x","y"), crs = NA)
+    coords_matrix <- do.call(rbind, st_geometry(spots_sf)) %>% as.matrix()
+    spots_sf$x <- coords_matrix[, 1]
+    spots_sf$y <- coords_matrix[, 2]
+    spots_sf$y <- max(spots_sf$y) - spots_sf$y + min(spots_sf$y)
+
+    x_range <- range(spots_sf$x)
+    y_range <- range(spots_sf$y)
+    x_buffer <- diff(x_range) * 0.1
+    y_buffer <- diff(y_range) * 0.1
+
+    if (show_image) {
+      image_obj <- seurat_obj@images[[image_name]]
+      tryCatch({
+        if (class(image_obj)[1] == "VisiumV1") {
+          he_image_data <- image_obj@image
+          coords_full <- GetTissueCoordinates(seurat_obj, image = image_name)
+          if ("pxl_col_in_fullres" %in% colnames(coords_full)) {
+            pixel_x <- coords_full$pxl_col_in_fullres
+            pixel_y <- coords_full$pxl_row_in_fullres
+          } else {
+            pixel_x <- spots_sf$x
+            pixel_y <- spots_sf$y
+          }
+          pixel_x_min <- min(pixel_x, na.rm = TRUE)
+          pixel_x_max <- max(pixel_x, na.rm = TRUE)
+          pixel_y_min <- min(pixel_y, na.rm = TRUE)
+          pixel_y_max <- max(pixel_y, na.rm = TRUE)
+          x_buffer_px <- (pixel_x_max - pixel_x_min) * 0.1
+          y_buffer_px <- (pixel_y_max - pixel_y_min) * 0.1
+          crop_x_min <- max(1, floor(pixel_x_min - x_buffer_px))
+          crop_x_max <- min(dim(he_image_data)[2], ceiling(pixel_x_max + x_buffer_px))
+          crop_y_min <- max(1, floor(pixel_y_min - y_buffer_px))
+          crop_y_max <- min(dim(he_image_data)[1], ceiling(pixel_y_max + y_buffer_px))
+          he_image_cropped <- he_image_data[crop_y_min:crop_y_max, crop_x_min:crop_x_max, ]
+          temp_file <- tempfile(fileext = ".png")
+          png(temp_file, width = dim(he_image_cropped)[2], height = dim(he_image_cropped)[1])
+          par(mar = c(0,0,0,0))
+          plot(as.raster(he_image_cropped), axes = FALSE)
+          dev.off()
+          he_image_base64 <- paste0("data:image/png;base64,", base64enc::base64encode(temp_file))
+          unlink(temp_file)
+          he_image_bounds <- list(
+            south = crop_y_max,
+            west = crop_x_min,
+            north = crop_y_min,
+            east = crop_x_max
+          )
+        }
+      }, error = function(e) {
+        print(paste("Could not extract H&E image:", e$message))
+      })
+    }
   }
-  
-  if (length(seurat_obj@images) == 0) {
-    stop("No spatial images found in the Seurat object.")
-  }
-  
-  image_name <- names(seurat_obj@images)[1]
-  all_genes <- rownames(seurat_obj)
-  all_metadata <- colnames(seurat_obj@meta.data)
-  
-  # Extract coordinates
-  tryCatch({
-    coords <- GetTissueCoordinates(seurat_obj, image = image_name)
-  }, error = function(e) {
-    coords <- seurat_obj@images[[image_name]]@coordinates
-  })
-  
+
+  example_data_path <- "SN048_A121573_Rep1.rds"
+  example_sample_label <- "Example Dataset"
+
   # Define signature library - HUMAN
   # Cell marker gene signatures curated from CellMarker 2.0 database
   # Citation: Hu C, Li T, Xu Y, et al. CellMarker 2.0: an updated database of 
@@ -1055,7 +1138,16 @@ run_spatial_selector <- function(seurat_input, sample_name = "sample", show_imag
                                                                            tags$li(tags$strong("Clear Everything:"), " Use the 🗑️ Clear Selection button to reset all selections and saved groups.")
                                                                    )
                                                           ),
-                                                          
+
+                                                          tags$div(style = "margin-bottom: 35px;",
+                                                                   tags$h2(style = "color: #0072B5; font-size: 26px; margin-bottom: 20px; border-bottom: 3px solid #E18727; padding-bottom: 10px;", "📬 Contact"),
+                                                                   tags$ul(style = "font-size: 14px; line-height: 1.8; color: #333; padding-left: 25px; margin: 0; list-style-type: none;",
+                                                                           tags$li(tags$strong("Aodong Qiu"), " (qiuaodon@pitt.edu)"),
+                                                                           tags$li(tags$strong("Mengyao Lu"), " (my.lu@pitt.edu)"),
+                                                                           tags$li(tags$strong("Lujia Chen"), " (luc17@pitt.edu)")
+                                                                   )
+                                                          ),
+
                                                           tags$div(style = "background: linear-gradient(135deg, #0072B5 0%, #E18727 100%); color: white; padding: 25px; border-radius: 8px; text-align: center;",
                                                                    tags$h2(style = "margin: 0 0 12px 0; font-size: 22px;", "🚀 Ready to Begin?"),
                                                                    tags$p(style = "margin: 0; font-size: 15px; line-height: 1.6;", "Click on the other tools in the sidebar (📤 Upload, 🧬 Gene Sets, etc.) to start your spatial analysis! The map will be visible when you switch to other tools.")
@@ -1408,7 +1500,9 @@ run_spatial_selector <- function(seurat_input, sample_name = "sample", show_imag
       bindEvent(once = TRUE, {TRUE})
     
     # Reactive values
-    current_sample_name <- reactiveVal(sample_name)  # Make sample_name reactive
+    initial_sample_name <- if (!is.null(seurat_obj)) sample_name else "No dataset loaded"
+    current_sample_name <- reactiveVal(initial_sample_name)  # Make sample_name reactive
+    data_loaded <- reactiveVal(!is.null(seurat_obj))
     drawn_feats <- reactiveVal(list())
     selected_spots <- reactiveVal(character(0))
     current_values <- reactiveVal(NULL)
@@ -1422,7 +1516,166 @@ run_spatial_selector <- function(seurat_input, sample_name = "sample", show_imag
     gene_set_scores <- reactiveVal(list())
     current_gene_set_score <- reactiveVal(NULL)
     cluster_results <- reactiveVal(NULL)
-    
+
+    load_new_dataset <- function(new_seurat, sample_label) {
+      if (!inherits(new_seurat, "Seurat")) {
+        stop("Provided object is not a valid Seurat object")
+      }
+
+      if (length(new_seurat@images) == 0) {
+        stop("No spatial images found in the provided Seurat object")
+      }
+
+      seurat_obj <<- new_seurat
+      current_sample_name(sample_label)
+      data_loaded(TRUE)
+
+      shinyjs::runjs("$('#loading_message').text('Updating gene and metadata lists...');")
+
+      all_genes <<- rownames(new_seurat)
+      all_metadata <<- colnames(new_seurat@meta.data)
+
+      updateSelectInput(session, "gene_select", choices = c("", all_genes))
+      updateSelectInput(session, "violin_gene", choices = c("", all_genes))
+      updateSelectInput(session, "compare_gene1", choices = c("", all_genes))
+      updateSelectInput(session, "compare_gene2", choices = c("", all_genes))
+      updateSelectInput(session, "meta_select", choices = c("", all_metadata))
+      updateSelectInput(session, "violin_metadata", choices = c("", all_metadata))
+      updateSelectInput(session, "compare_meta1", choices = c("", all_metadata))
+      updateSelectInput(session, "compare_meta2", choices = c("", all_metadata))
+
+      shinyjs::runjs("$('#loading_message').text('Extracting spatial coordinates...');")
+
+      image_name <<- names(new_seurat@images)[1]
+      coords <- tryCatch({
+        GetTissueCoordinates(new_seurat, image = image_name)
+      }, error = function(e) {
+        new_seurat@images[[image_name]]@coordinates
+      })
+
+      spots_df <- data.frame(spot_id = rownames(coords), stringsAsFactors = FALSE)
+      if ("imagerow" %in% colnames(coords) && "imagecol" %in% colnames(coords)) {
+        spots_df$x <- coords$imagecol
+        spots_df$y <- coords$imagerow
+      } else if ("row" %in% colnames(coords) && "col" %in% colnames(coords)) {
+        spots_df$x <- coords$col
+        spots_df$y <- coords$row
+      } else {
+        spots_df$x <- coords[,1]
+        spots_df$y <- coords[,2]
+      }
+
+      spots_sf <<- st_as_sf(spots_df, coords = c("x","y"), crs = NA)
+      coords_matrix <- do.call(rbind, st_geometry(spots_sf)) %>% as.matrix()
+      spots_sf$x <<- coords_matrix[, 1]
+      spots_sf$y <<- coords_matrix[, 2]
+      spots_sf$y <<- max(spots_sf$y) - spots_sf$y + min(spots_sf$y)
+
+      shinyjs::runjs("$('#loading_message').text('Extracting H&E image...');")
+
+      he_image_base64 <<- NULL
+      he_image_bounds <<- NULL
+
+      if (show_image) {
+        tryCatch({
+          image_obj <- new_seurat@images[[image_name]]
+          he_image_data <- image_obj@image
+          coords_full <- GetTissueCoordinates(new_seurat, image = image_name)
+
+          if ("pxl_col_in_fullres" %in% colnames(coords_full)) {
+            pixel_x <- coords_full$pxl_col_in_fullres
+            pixel_y <- coords_full$pxl_row_in_fullres
+          } else {
+            pixel_x <- spots_sf$x
+            pixel_y <- spots_sf$y
+          }
+
+          pixel_x_min <- min(pixel_x, na.rm = TRUE)
+          pixel_x_max <- max(pixel_x, na.rm = TRUE)
+          pixel_y_min <- min(pixel_y, na.rm = TRUE)
+          pixel_y_max <- max(pixel_y, na.rm = TRUE)
+          x_buffer_px <- (pixel_x_max - pixel_x_min) * 0.1
+          y_buffer_px <- (pixel_y_max - pixel_y_min) * 0.1
+          crop_x_min <- max(1, floor(pixel_x_min - x_buffer_px))
+          crop_x_max <- min(dim(he_image_data)[2], ceiling(pixel_x_max + x_buffer_px))
+          crop_y_min <- max(1, floor(pixel_y_min - y_buffer_px))
+          crop_y_max <- min(dim(he_image_data)[1], ceiling(pixel_y_max + y_buffer_px))
+          he_image_cropped <- he_image_data[crop_y_min:crop_y_max, crop_x_min:crop_x_max, ]
+
+          temp_file <- tempfile(fileext = ".png")
+          png(temp_file, width = dim(he_image_cropped)[2], height = dim(he_image_cropped)[1])
+          par(mar = c(0,0,0,0))
+          plot(as.raster(he_image_cropped), axes = FALSE)
+          dev.off()
+
+          he_image_base64 <<- paste0("data:image/png;base64,", base64enc::base64encode(temp_file))
+          unlink(temp_file)
+
+          he_image_bounds <<- list(
+            south = crop_y_max,
+            west = crop_x_min,
+            north = crop_y_min,
+            east = crop_x_max
+          )
+
+          session$sendCustomMessage("updateHEImage", list(
+            imageUrl = he_image_base64,
+            bounds = he_image_bounds
+          ))
+
+          Sys.sleep(0.5)
+        }, error = function(e) {
+          print(paste("Could not extract H&E image from new data:", e$message))
+          he_image_base64 <<- NULL
+        })
+      }
+
+      drawn_feats(list())
+      selected_spots(character(0))
+      group1_spots(character(0))
+      group2_spots(character(0))
+      current_values(NULL)
+      deg_results(NULL)
+      violin_data(NULL)
+      compare_data(NULL)
+      gene_set_scores(list())
+      current_gene_set_score(NULL)
+      cluster_results(NULL)
+
+      shinyjs::runjs("$('#loading_message').text('Rendering map with new spots...');")
+
+      x_range <<- range(spots_sf$x)
+      y_range <<- range(spots_sf$y)
+      x_buffer <<- diff(x_range) * 0.1
+      y_buffer <<- diff(y_range) * 0.1
+
+      leafletProxy("map") %>%
+        clearGroup("spots") %>%
+        clearGroup("drawn") %>%
+        clearGroup("selected") %>%
+        clearGroup("group1_display") %>%
+        clearGroup("group2_display") %>%
+        fitBounds(
+          lng1 = x_range[1] - x_buffer, lat1 = y_range[1] - y_buffer,
+          lng2 = x_range[2] + x_buffer, lat2 = y_range[2] + y_buffer
+        ) %>%
+        addCircleMarkers(
+          lng = spots_sf$x, lat = spots_sf$y,
+          radius = 5, stroke = TRUE, color = "black", weight = 0.5,
+          fillColor = "lightblue", fillOpacity = 0.8, group = "spots"
+        )
+
+      nrow(spots_sf)
+    }
+
+    ensure_data_loaded <- function(message = "Please load a dataset first.") {
+      if (!data_loaded() || is.null(seurat_obj)) {
+        showNotification(message, type = "error", duration = 5)
+        return(FALSE)
+      }
+      TRUE
+    }
+
     # Dynamic header title
     output$header_title <- renderText({
       paste("🔬 SpatialScope -", current_sample_name())
@@ -1563,8 +1816,10 @@ run_spatial_selector <- function(seurat_input, sample_name = "sample", show_imag
     
     # Upload status display
     output$upload_status <- renderText({
-      if (is.null(input$upload_seurat)) {
-        "No file uploaded. Using current data."
+      if (!data_loaded()) {
+        "No dataset loaded. Upload a file or load the example dataset to begin."
+      } else if (is.null(input$upload_seurat)) {
+        paste("Current dataset:", current_sample_name())
       } else {
         paste("File ready:", input$upload_seurat$name)
       }
@@ -1573,203 +1828,41 @@ run_spatial_selector <- function(seurat_input, sample_name = "sample", show_imag
     # Load uploaded Seurat object
     observeEvent(input$load_uploaded_seurat, {
       req(input$upload_seurat)
-      
+
       # Show loading overlay with custom message
       shinyjs::runjs("
         $('#loading_message').text('Uploading and processing new dataset...');
         $('#loading_overlay').addClass('active');
       ")
-      
+
       showNotification("Loading new Seurat object...", type = "message", duration = NULL, id = "load_seurat")
-      
+
       # Add a small delay to ensure loading screen shows
       Sys.sleep(0.3)
-      
+
       tryCatch({
-        # Load the new Seurat object
         new_seurat <- readRDS(input$upload_seurat$datapath)
-        
-        # Update sample name from uploaded file
         uploaded_filename <- tools::file_path_sans_ext(input$upload_seurat$name)
-        current_sample_name(uploaded_filename)
-        
-        # Validate it's a Seurat object
-        if (!inherits(new_seurat, "Seurat")) {
-          stop("Uploaded file is not a valid Seurat object")
-        }
-        
-        # Check for spatial images
-        if (length(new_seurat@images) == 0) {
-          stop("No spatial images found in the uploaded Seurat object")
-        }
-        
-        # Replace the global seurat object (dangerous but necessary for this use case)
-        seurat_obj <<- new_seurat
-        
-        # Update loading message
-        shinyjs::runjs("$('#loading_message').text('Updating gene and metadata lists...');")
-        
-        # Update all gene and metadata lists
-        all_genes <- rownames(new_seurat)
-        all_metadata <- colnames(new_seurat@meta.data)
-        
-        # Update the selectInputs with new gene/metadata lists
-        updateSelectInput(session, "gene_select", choices = c("", all_genes))
-        updateSelectInput(session, "violin_gene", choices = c("", all_genes))
-        updateSelectInput(session, "compare_gene1", choices = c("", all_genes))
-        updateSelectInput(session, "compare_gene2", choices = c("", all_genes))
-        updateSelectInput(session, "meta_select", choices = c("", all_metadata))
-        updateSelectInput(session, "violin_metadata", choices = c("", all_metadata))
-        updateSelectInput(session, "compare_meta1", choices = c("", all_metadata))
-        updateSelectInput(session, "compare_meta2", choices = c("", all_metadata))
-        
-        # Update loading message
-        shinyjs::runjs("$('#loading_message').text('Extracting spatial coordinates...');")
-        
-        # Extract new coordinates
-        image_name <- names(new_seurat@images)[1]
-        tryCatch({
-          coords <- GetTissueCoordinates(new_seurat, image = image_name)
-        }, error = function(e) {
-          coords <- new_seurat@images[[image_name]]@coordinates
-        })
-        
-        spots_df <- data.frame(spot_id = rownames(coords), stringsAsFactors = FALSE)
-        if ("imagerow" %in% colnames(coords) && "imagecol" %in% colnames(coords)) {
-          spots_df$x <- coords$imagecol
-          spots_df$y <- coords$imagerow
-        } else if ("row" %in% colnames(coords) && "col" %in% colnames(coords)) {
-          spots_df$x <- coords$col
-          spots_df$y <- coords$row
-        } else {
-          spots_df$x <- coords[,1]
-          spots_df$y <- coords[,2]
-        }
-        
-        spots_sf <<- st_as_sf(spots_df, coords = c("x","y"), crs = NA)
-        coords_matrix <- do.call(rbind, st_geometry(spots_sf)) %>% as.matrix()
-        spots_sf$x <<- coords_matrix[, 1]
-        spots_sf$y <<- coords_matrix[, 2]
-        spots_sf$y <<- max(spots_sf$y) - spots_sf$y + min(spots_sf$y)
-        
-        # Update loading message
-        shinyjs::runjs("$('#loading_message').text('Extracting H&E image...');")
-        
-        # Extract and update H&E image from new data
-        tryCatch({
-          if (show_image) {
-            image_obj <- new_seurat@images[[image_name]]
-            he_image_data <- image_obj@image
-            coords_full <- GetTissueCoordinates(new_seurat, image = image_name)
-            
-            if ("pxl_col_in_fullres" %in% colnames(coords_full)) {
-              pixel_x <- coords_full$pxl_col_in_fullres
-              pixel_y <- coords_full$pxl_row_in_fullres
-            } else {
-              pixel_x <- spots_sf$x
-              pixel_y <- spots_sf$y
-            }
-            
-            pixel_x_min <- min(pixel_x, na.rm = TRUE)
-            pixel_x_max <- max(pixel_x, na.rm = TRUE)
-            pixel_y_min <- min(pixel_y, na.rm = TRUE)
-            pixel_y_max <- max(pixel_y, na.rm = TRUE)
-            x_buffer_px <- (pixel_x_max - pixel_x_min) * 0.1
-            y_buffer_px <- (pixel_y_max - pixel_y_min) * 0.1
-            crop_x_min <- max(1, floor(pixel_x_min - x_buffer_px))
-            crop_x_max <- min(dim(he_image_data)[2], ceiling(pixel_x_max + x_buffer_px))
-            crop_y_min <- max(1, floor(pixel_y_min - y_buffer_px))
-            crop_y_max <- min(dim(he_image_data)[1], ceiling(pixel_y_max + y_buffer_px))
-            he_image_cropped <- he_image_data[crop_y_min:crop_y_max, crop_x_min:crop_x_max, ]
-            
-            temp_file <- tempfile(fileext = ".png")
-            png(temp_file, width = dim(he_image_cropped)[2], height = dim(he_image_cropped)[1])
-            par(mar = c(0,0,0,0))
-            plot(as.raster(he_image_cropped), axes = FALSE)
-            dev.off()
-            
-            he_image_base64 <<- paste0("data:image/png;base64,", base64enc::base64encode(temp_file))
-            unlink(temp_file)
-            
-            he_image_bounds <<- list(
-              south = crop_y_max,
-              west = crop_x_min,
-              north = crop_y_min,
-              east = crop_x_max
-            )
-            
-            # Update H&E image on map
-            session$sendCustomMessage("updateHEImage", list(
-              imageUrl = he_image_base64,
-              bounds = he_image_bounds
-            ))
-            
-            # Wait for H&E image to load
-            Sys.sleep(0.5)
-          }
-        }, error = function(e) {
-          print(paste("Could not extract H&E image from new data:", e$message))
-          he_image_base64 <<- NULL
-        })
-        
-        # Clear all selections and results
-        drawn_feats(list())
-        selected_spots(character(0))
-        group1_spots(character(0))
-        group2_spots(character(0))
-        current_values(NULL)
-        deg_results(NULL)
-        violin_data(NULL)
-        compare_data(NULL)
-        gene_set_scores(list())
-        current_gene_set_score(NULL)
-        cluster_results(NULL)
-        
-        # Update loading message
-        shinyjs::runjs("$('#loading_message').text('Rendering map with new spots...');")
-        
-        # Clear map and redraw with new data
-        x_range <- range(spots_sf$x)
-        y_range <- range(spots_sf$y)
-        x_buffer <- diff(x_range) * 0.1
-        y_buffer <- diff(y_range) * 0.1
-        
-        leafletProxy("map") %>%
-          clearGroup("spots") %>%
-          clearGroup("drawn") %>%
-          clearGroup("selected") %>%
-          clearGroup("group1_display") %>%
-          clearGroup("group2_display") %>%
-          fitBounds(
-            lng1 = x_range[1] - x_buffer, lat1 = y_range[1] - y_buffer,
-            lng2 = x_range[2] + x_buffer, lat2 = y_range[2] + y_buffer
-          ) %>%
-          addCircleMarkers(
-            lng = spots_sf$x, lat = spots_sf$y,
-            radius = 5, stroke = TRUE, color = "black", weight = 0.5,
-            fillColor = "lightblue", fillOpacity = 0.8, group = "spots"
-          )
-        
-        # Update loading message for final step
+
+        n_spots <- load_new_dataset(new_seurat, uploaded_filename)
+
         shinyjs::runjs("$('#loading_message').text('Finalizing visualization...');")
-        
+
         removeNotification(id = "load_seurat")
-        
-        # Use JavaScript setTimeout with longer delay to ensure map fully renders
-        # This gives the browser enough time to render all spots and H&E image
+
         shinyjs::runjs("
           setTimeout(function() {
             $('#loading_overlay').removeClass('active');
           }, 5000);
         ")
-        
-        showNotification(paste("Successfully loaded", current_sample_name(), "with", 
-                               nrow(spots_sf), "spots. All analyses will now use this new dataset."), 
+
+        showNotification(paste("Successfully loaded", current_sample_name(), "with",
+                               n_spots, "spots. All analyses will now use this new dataset."),
                          type = "message", duration = 7)
-        
+
       }, error = function(e) {
         removeNotification(id = "load_seurat")
-        
+
         # Hide loading overlay on error
         shinyjs::runjs("$('#loading_overlay').removeClass('active');")
         
@@ -1780,8 +1873,34 @@ run_spatial_selector <- function(seurat_input, sample_name = "sample", show_imag
     
     # Use Example Data button handler
     observeEvent(input$use_example_data, {
-      showNotification("You are currently using the example dataset. The example data is loaded by default.", 
-                       type = "message", duration = 5)
+      shinyjs::runjs("$('#loading_message').text('Loading example dataset...'); $('#loading_overlay').addClass('active');")
+      showNotification("Loading example dataset...", type = "message", duration = NULL, id = "load_example")
+
+      Sys.sleep(0.3)
+
+      tryCatch({
+        if (!file.exists(example_data_path)) {
+          stop("Example dataset is not available on the server")
+        }
+
+        example_seurat <- readRDS(example_data_path)
+
+        n_spots <- load_new_dataset(example_seurat, example_sample_label)
+
+        shinyjs::runjs("$('#loading_message').text('Finalizing visualization...');")
+
+        removeNotification(id = "load_example")
+
+        shinyjs::runjs("setTimeout(function() { $('#loading_overlay').removeClass('active'); }, 5000);")
+
+        showNotification(paste("Example dataset loaded with", n_spots, "spots."),
+                         type = "message", duration = 7)
+      }, error = function(e) {
+        removeNotification(id = "load_example")
+        shinyjs::runjs("$('#loading_overlay').removeClass('active');")
+        showNotification(paste("Unable to load example dataset:", e$message),
+                         type = "error", duration = 10)
+      })
     })
     
     # Selection summary
@@ -1815,8 +1934,10 @@ run_spatial_selector <- function(seurat_input, sample_name = "sample", show_imag
     
     # Clustering
     observeEvent(input$run_clustering, {
+      if (!ensure_data_loaded("Please load a dataset before running clustering.")) return()
+
       showNotification("Running clustering...", type = "message", duration = NULL, id = "clustering_run")
-      
+
       tryCatch({
         # Determine which spots to cluster based on selection
         spots_to_cluster <- switch(input$cluster_spot_selection,
@@ -2056,8 +2177,10 @@ run_spatial_selector <- function(seurat_input, sample_name = "sample", show_imag
     }
     
     observeEvent(input$calculate_gene_set, {
+      if (!ensure_data_loaded("Load a dataset before calculating gene set scores.")) return()
+
       req(input$gene_set_input)
-      
+
       genes <- unlist(strsplit(input$gene_set_input, "[,\n\r\t ]+"))
       genes <- genes[genes != ""]
       
@@ -2708,6 +2831,8 @@ run_spatial_selector <- function(seurat_input, sample_name = "sample", show_imag
     
     # DEG Analysis
     observeEvent(input$run_deg, {
+      if (!ensure_data_loaded("Load a dataset before running differential expression analysis.")) return()
+
       g1 <- group1_spots()
       g2 <- group2_spots()
       
@@ -2780,6 +2905,8 @@ run_spatial_selector <- function(seurat_input, sample_name = "sample", show_imag
     
     # Violin plot
     observeEvent(input$plot_violin, {
+      if (!ensure_data_loaded("Load a dataset before generating violin plots.")) return()
+
       if (input$violin_feature_type == "gene") {
         feature <- input$violin_gene
       } else if (input$violin_feature_type == "metadata") {
@@ -2883,6 +3010,8 @@ run_spatial_selector <- function(seurat_input, sample_name = "sample", show_imag
     
     # Feature comparison
     observeEvent(input$plot_compare, {
+      if (!ensure_data_loaded("Load a dataset before generating comparison plots.")) return()
+
       # Get feature 1
       if (input$compare_type1 == "gene") {
         feature1 <- input$compare_gene1
@@ -3245,8 +3374,7 @@ run_spatial_selector <- function(seurat_input, sample_name = "sample", show_imag
   shinyApp(ui, server)
 }
 
-SN048_A121573_Rep1 <- readRDS("SN048_A121573_Rep1.rds")
-run_spatial_selector(SN048_A121573_Rep1, "Welcome!", show_image = TRUE)
+run_spatial_selector(NULL, "Welcome!", show_image = TRUE)
 
 
 
